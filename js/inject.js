@@ -1,134 +1,122 @@
 'use strict'
 {
-    let dataPath
-    let arrayKey
+    const prop = '[\\w$]{1,3}'
+    const targetRegex = new RegExp(
+        `^values\\(\\){return this\\.(${prop})\\.values\\(\\)}$`
+    )
 
-    const regex1 = /function\(\){_\.[a-zA-Z0-9$_]{2,3}\.prototype\.[a-zA-Z0-9$_]{2,3}\.call\(this\);[a-zA-Z0-9$_]{2,3}\(this\)}/
-    const regex2 = /[a-zA-Z0-9$_]{2,3}\(\){super\.[a-zA-Z0-9$_]{2,3}\(\);[a-zA-Z0-9$_]{2,3}\(this\)}/
-    const nameRegex = /(\(|\[)([^\(\[\)\]]+)(\)|\])/
+    let retries = 0
+    const maxRetries = 10000
+
+    const hooker = {
+        getNames: function () {
+            const data = [...this.map.values()]
+            if (!this.dataPath) {
+                for (const key in data[0]) {
+                    for (const subKey in data[0][key]) {
+                        const array = data[0][key][subKey]
+                        if (
+                            !Array.isArray(array) ||
+                            !array[0]?.startsWith?.('spaces/')
+                        ) {
+                            continue
+                        }
+                        this.dataPath = [key, subKey]
+                        Utils.log('Located participant data.')
+                    }
+                }
+            }
+            // BEST GUESSES
+            // {
+            //     0: their participant id
+            //     1: the URL of their profile picture
+            //     6: true if they are not the same account as the host, false otherwise
+            //     7: true if they started the Meet (including presenters), false otherwise
+            //     11: true if they are presenting, false otherwise
+            //     12: true if they are the active presenter, false otherwise
+            //     14: true if they started the Meet (excluding presenters), false otherwise
+            //     15: true if they started the Meet and are presenting, false otherwise
+            //     16: true if they are not presenting, false otherwise
+            //     28: their full name
+            //     29: 5 if they are in the Meet, 7 if they have left
+            //     31: (present if presenting) the participant id of the presenting controller
+            //     32: true if they are in the Meet, false otherwise
+            //     33: true if they are in the Meet, false otherwise
+            //     36: (present if 45 excluding presenters) true if they are present and did not start the Meet, false otherwise
+            //     37: their first name
+            //     39: (present if 14 and not presenting) undefined
+            //     45: true if they are the same account as the host, false otherwise
+            //     51: 1 if they started the Meet (including presenters), 3 otherwise
+            // }
+            return data
+                .map((obj) => obj[this.dataPath[0]][this.dataPath[1]])
+                .filter((p) => !p[7] && p[16] && p[32])
+                .map((p) => Utils.getNames(p[28], p[37]).join('|'))
+        }
+    }
 
     const finder = setInterval(attemptHook, 1)
 
     function attemptHook() {
-        log(`Attempting hook...`)
-        outer: for (const _k in window.default_MeetingsUi) {
-            const v = window.default_MeetingsUi[_k]
-            if (!v || !v.prototype) {
-                continue
-            }
-            for (const k of Object.getOwnPropertyNames(v.prototype)) {
-                const p = Object.getOwnPropertyDescriptor(v.prototype, k)
-                if (
-                    k === 'constructor' ||
-                    !p ||
-                    !p.value ||
-                    v.prototype[k].__grid_ran
-                ) {
-                    continue
-                }
-                const funcString = p.value.toString()
-                if (!regex1.test(funcString) && !regex2.test(funcString)) {
-                    continue
-                }
-                const og = v.prototype[k]
-                v.prototype[k] = function () {
-                    window.dispatchEvent(
-                        new CustomEvent('atd', { detail: this })
-                    )
-                    og.call(this)
-                }
-                log(
-                    `Successfully hooked into participant data function at ${_k}.prototype.${k}.`
+        console.log('attempting')
+        try {
+            for (const key in window.default_MeetingsUi) {
+                const val = window.default_MeetingsUi[key]
+                if (!val?.prototype) continue
+                const getAll = Object.getOwnPropertyDescriptor(
+                    val.prototype,
+                    'getAll'
                 )
+                const values = Object.getOwnPropertyDescriptor(
+                    val.prototype,
+                    'values'
+                )
+                if (!getAll?.value || !values?.value) continue
+                const match = values.value.toString().match(targetRegex)
+                if (!match) continue
+                hooker.target = values.value
+                const og = val.prototype.values
+                val.prototype.values = function () {
+                    hooker.map = Object.values(this[match[1]]).find(
+                        (map) =>
+                            map instanceof Map &&
+                            map.values().next()?.value?.name
+                    )
+                    val.prototype.values = og
+                    return og.call(this)
+                }
+                Utils.log(`Successfully hooked into ${key}#values.`)
                 clearInterval(finder)
-                break outer
+                break
             }
+        } catch (e) {
+            console.error(e)
+        }
+        if (++retries == maxRetries) {
+            Utils.log(
+                `Unable to perform hook within ${maxRetries / 1000} seconds.`
+            )
+            clearInterval(finder)
         }
     }
 
-    window.addEventListener('atd', (event) => {
-        if (!dataPath) {
-            identifyDataPath(event.detail)
-        }
-        const data = event.detail[dataPath[0]][dataPath[1]][dataPath[2]].get(
-            dataPath[3]
-        )[dataPath[4]][dataPath[5]]
-
-        let names = []
-        for (const participantData of Object.values(data)) {
-            const meta = participantData[arrayKey]
-            const isInMeet = meta[4]
-            const isYou = meta[6].length > 0
-            const isPresenting = meta[20] !== undefined
-            if (isInMeet && !isYou && !isPresenting) {
-                const fullName = meta[1]
-                const firstName = meta[28].replace(nameRegex, '').trim()
-                const lastName = fullName
-                    .replace(firstName, '')
-                    .replace(nameRegex, '')
-                    .replace(',', '')
-                    .trim()
-                names.push(firstName + '|' + lastName)
-            }
-        }
-
-        window.postMessage(
-            {
-                attendance: names,
-                sender: 'Ya boi',
-            },
-            'https://meet.google.com'
-        )
-    })
-
-    function identifyDataPath(details) {
-        for (const [___k, ___v] of Object.entries(details)) {
-            if (!___v) {
-                continue
-            }
-            for (const [__k, __v] of Object.entries(___v)) {
-                if (!__v) {
-                    continue
-                }
-                for (const [_k, _v] of Object.entries(__v)) {
-                    if (!_v || !(_v instanceof Map) || _v.size === 0) {
-                        continue
-                    }
-                    const [k, v] = _v.entries().next().value
-                    if (
-                        typeof k !== 'string' ||
-                        k.substring(0, 7) !== 'spaces/'
-                    ) {
-                        continue
-                    }
-                    for (const [k_, v_] of Object.entries(v)) {
-                        if (!v_ || !v_.hasOwnProperty('data')) {
-                            continue
-                        }
-                        dataPath = [___k, __k, _k, k, k_, 'data']
-                        for (const v__ of Object.values(v_.data)) {
-                            for (const [k___, v___] of Object.entries(v__)) {
-                                if (!Array.isArray(v___)) {
-                                    continue
-                                }
-                                arrayKey = k___
-                                log(
-                                    `Found path to participant data at {source}.${___k}.${__k}.${_k}.${k}.${k_}.data.{id}.${k___}.`
-                                )
-                                return
-                            }
-                        }
-                    }
-                }
-            }
+    let lastNames = []
+    function sendUpdate() {
+        const names = hooker.getNames()
+        if (!Utils.areEqualArrays(lastNames, names)) {
+            console.log(names)
+            lastNames = names
+            window.postMessage(
+                {
+                    attendance: names,
+                    sender: 'A4GM',
+                },
+                'https://meet.google.com'
+            )
         }
     }
 
-    function log(message) {
-        console.log(
-            `%c[A4GM]%c ${message} `,
-            'color:white;background:#058D80',
-            'font-weight:bold;color:#058D80;'
-        )
-    }
+    setInterval(sendUpdate, 500)
+
+    window.hooker = hooker
 }
